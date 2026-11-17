@@ -1,0 +1,15 @@
+reference/
+analysis/
+release/
+tools/
+*.swf
+validation.js
+package.json
+tests/*
+!tests/checks.js
+assets/manifest.json
+assets/fonts/hud.ttf
+__pycache__/
+*.py[cod]
+.validation/
+tests/
