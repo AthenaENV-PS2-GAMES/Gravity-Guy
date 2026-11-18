@@ -8,6 +8,7 @@ import { createSaveStore } from './save.js';
 import { runChecks } from '../tests/checks.js';
 import { MENU_ART, moveMain } from './menu.js';
 import { CREDITS } from './credits.js';
+import { createIntro, stepIntro, dueSounds, introTiles, pagesAhead, SOUND_FILES } from './intro.js';
 
 const S = 448 / 501,
   OX0 = (640 - 640 * S) / 2;
@@ -58,6 +59,10 @@ export function startGame({
   perfRun = false,
   perfCheckpoint = 0,
   soak = false,
+  soakSpeed = 260,
+  useAtlas = true, // false: old baked 512 px pages streamed through ImageList
+  startScore = 0,
+  startCheckpoint = null, // comparison runs: boot straight into the campaign at this checkpoint, nothing is saved
 } = {}) {
   const mode = Screen.getMode();
   Object.assign(mode, {
@@ -94,7 +99,7 @@ export function startGame({
   const images = new Map();
   let bytes = 0,
     drawFrameNumber = 0;
-  const perf = { names: [], queued: 0, frames: [], loads: 0, frees: 0, events: [], sec: {}, last: 0 };
+  const perf = { sprites: 0, missing: 0, names: [], queued: 0, frames: [], loads: 0, frees: 0, events: [], sec: {}, last: 0 };
   const pf = (k) => {
     if (!perfRun) return;
     const t = System.getMilliseconds();
@@ -104,13 +109,29 @@ export function startGame({
     perf.last = t;
   };
 
+  const textureRetry = new Map();
+
   function texture(path) {
     let e = images.get(path);
     if (!e) {
       perf.loads++;
       if (perfRun && perf.names.length < 6) perf.names.push(path.replace('assets/', ''));
-      const image = new Image(path);
-      if (!image.ready()) throw Error('Image failed: ' + path);
+      if ((textureRetry.get(path) || 0) > drawFrameNumber) return null;
+      let image = null;
+      for (let attempt = 0; attempt < 2 && !image; attempt++) {
+        try {
+          const img = new Image(path);
+          if (img.ready()) image = img;
+        } catch (err) {
+          // out of EE/VRAM: free everything idle and try once more
+        }
+        if (!image && attempt === 0) emergencyTrim();
+      }
+      if (!image) {
+        console.log('GG_TEXTURE_FAIL ' + path + ' ee=' + System.getFreeMemory() + ' vram=' + Screen.getFreeVRAM() + ' bytes=' + bytes);
+        textureRetry.set(path, drawFrameNumber + 10);
+        return null;
+      }
       image.optimize();
       e = { image, seen: 0, bytes: image.size };
       images.set(path, e);
@@ -142,7 +163,15 @@ export function startGame({
 
     if (e) {
       e.seen = drawFrameNumber;
-      if (e.image.ready()) return e.image;
+      if (e.image.ready()) {
+        const real = e.image.size;
+        if (real > 0) {
+          bytes += real - e.bytes;
+          e.bytes = real;
+        }
+        e.async = false;
+        return e.image;
+      }
       if (!e.image.failed()) return null;
       const err = e.image.error && e.image.error();
       console.log(
@@ -160,7 +189,7 @@ export function startGame({
       e.image.free();
       images.delete(path);
       bytes -= e.bytes;
-      retryAt.set(path, drawFrameNumber + 20);
+      retryAt.set(path, drawFrameNumber + 6);
       emergencyTrim();
       return null;
     }
@@ -183,16 +212,23 @@ export function startGame({
       bytes += 262144;
     } catch (err) {
       console.log('GG_TILE_QUEUE_FAIL ' + path + ' ' + err + ' ee=' + System.getFreeMemory());
-      retryAt.set(path, drawFrameNumber + 20);
+      retryAt.set(path, drawFrameNumber + 6);
       emergencyTrim();
     }
+  }
+
+  // How far ahead of the camera tiles are queued: grows with speed so fast runs don't outrun the loader.
+  function lookahead() {
+    const p = state && state.players && state.players[0];
+    const v = p && p.vx > 0 ? p.vx : 0;
+    return Math.max(1100, Math.min(2300, Math.round(v * 2.4)));
   }
 
   function prefetchAround(camera, priority) {
     if (!renderBins) return;
     for (const kind of ['back', 'front'])
       for (const q of renderBins[kind])
-        if (q.x + q.w >= camera - 64 && q.x <= camera + 640 + 1100) prefetchTile(q.path, priority);
+        if (q.x + q.w >= camera - 64 && q.x <= camera + 640 + lookahead()) prefetchTile(q.path, priority);
   }
 
   const pinned = new Set();
@@ -233,14 +269,14 @@ export function startGame({
     }
   }
 
-  const IMAGE_CAP = 10 * 1024 * 1024;
+  const IMAGE_CAP = 8 * 1024 * 1024;
 
   function trimImages() {
     if (drawFrameNumber % 30 && bytes < IMAGE_CAP) return;
     for (const [path, e] of images) {
       if (pinned.has(path)) continue;
       const idle = drawFrameNumber - e.seen;
-      if (idle > 3 && ((bytes > IMAGE_CAP && idle > 240) || idle > 1800)) {
+      if (idle > 3 && ((bytes > IMAGE_CAP && idle > 90) || idle > 1800)) {
         perf.frees++;
         e.image.free();
         images.delete(path);
@@ -265,7 +301,9 @@ export function startGame({
       return;
     }
     for (const q of a.parts) {
-      texture(q.path).draw(Math.round(OX + (x + q.x * sx) * K), Math.round(OY + (y + q.y * sy) * K), {
+      const img = texture(q.path);
+      if (!img) continue;
+      img.draw(Math.round(OX + (x + q.x * sx) * K), Math.round(OY + (y + q.y * sy) * K), {
         width: q.w * sx * K,
         height: q.h * sy * K,
         color: tint,
@@ -278,7 +316,9 @@ export function startGame({
     const a = ASSETS[name],
       q = a && a.frames && a.frames[n];
     if (!q) return;
-    texture(q.path).draw(OX + x * K, OY + y * K, {
+    const img = texture(q.path);
+    if (!img) return;
+    img.draw(OX + x * K, OY + y * K, {
       startx: q.x,
       starty: q.y,
       endx: q.x + q.w,
@@ -304,6 +344,7 @@ export function startGame({
     state = null;
     renderLevel = null;
     renderBins = null;
+    freeAtlas();
     loadedLevel = null;
     loadedMeta = null;
     std.gc();
@@ -350,9 +391,10 @@ export function startGame({
   Gamepad.configure({ multitap: true });
   const pads = [0, 1, 2, 3].map((i) => Gamepad.player(i));
   const pending = [false, false, false, false];
-  const store = createSaveStore(!validation && !menuValidation),
+  const store = createSaveStore(!validation && !menuValidation && !startCheckpoint),
     prefs = store.data;
-  let tutorial = 0,
+  let multiTimer = 0.5, // PlayState.multiStartFlicker (static in the original: it carries over between rounds)
+    tutorial = 0,
     screen = 'menu',
     cursor = 0,
     subCursor = 0,
@@ -468,6 +510,8 @@ export function startGame({
 
   const streams = {};
 
+  const GAME_MUSIC_VOLUME = 70; // Sound.setVolume scale 0-100; was 30 (sfx sit at 55)
+
   function playMusic(name, fresh = false) {
     if (musicName !== name) {
       if (music && musicPlaying) {
@@ -481,7 +525,7 @@ export function startGame({
       if (fresh || name === 'SndMusic') music.rewind();
     }
     if (prefs.music && !musicPlaying) {
-      Sound.setVolume(name === 'SndMenuMusic' ? 27 : 30);
+      Sound.setVolume(name === 'SndMenuMusic' ? 27 : GAME_MUSIC_VOLUME);
       music.play({ fade: 400 });
       musicPlaying = true;
       console.log('GG_MUSIC ' + name + ' converted=' + music.converted);
@@ -571,6 +615,146 @@ export function startGame({
     console.log('GG_MENU_READY');
   }
 
+  // Armor Games opening (the original's FlxPreloader child): see game/intro.js. Pages stream in as the frames need them.
+  let intro = null,
+    introMeta = null,
+    introSfx = null,
+    introShown = [],
+    introStarted = false,
+    introWait = 0,
+    introStalls = 0;
+  const introPath = (page) => introMeta.pages[page].file;
+  // The original builds the menu only when the preloader hands over; here its pictures are loaded one per frame while the
+  // intro plays so the first menu frame does not stall on the disk.
+  const MENU_WARM = [
+    'MenuState_ImgMenuBackground',
+    'MenuState_ImgLeftGuy',
+    'MenuState_ImgRightGuy',
+    ...MENU_ART.main.flatMap((b) => [b.asset, b.over]),
+    'MenuState_ImgMiniclip',
+    'MenuState_ImgLogoHL',
+    'MenuState_ImgSoundButOn',
+    'MenuState_ImgSoundButOnHL',
+    'MenuState_ImgSoundBut',
+    'MenuState_ImgSoundButHL',
+  ];
+  let introWarm = 0;
+
+  function warmMenuArt() {
+    const a = ASSETS[MENU_WARM[introWarm++]];
+    if (a && a.parts) for (const q of a.parts) texture(q.path);
+  }
+
+  function enterIntro() {
+    introMeta = JSON.parse(std.loadFile('assets/intro/intro.json'));
+    intro = createIntro(introMeta);
+    introShown = [];
+    introStarted = false;
+    introWait = 0;
+    introStalls = 0;
+    introWarm = 0;
+    screen = 'intro';
+    paused = false;
+    Sound.setVolume(30);
+    introSfx = {};
+    for (const id of Object.keys(SOUND_FILES)) {
+      try {
+        introSfx[id] = new Sound.Sfx('assets/audio/' + SOUND_FILES[id] + '.adp');
+        introSfx[id].volume = 55;
+      } catch (e) {
+        console.log('GG_AUDIO_ERROR intro ' + id + ' ' + e);
+      }
+    }
+    introPrefetch();
+    console.log('GG_INTRO');
+  }
+
+  function leaveIntro() {
+    for (const [path, e] of images) {
+      if (!path.startsWith('assets/intro/')) continue;
+      e.image.free();
+      images.delete(path);
+      bytes -= e.bytes;
+    }
+    if (introSfx) {
+      for (const id of Object.keys(introSfx)) {
+        introSfx[id].stop();
+        introSfx[id].free();
+      }
+      introSfx = null;
+    }
+    console.log('GG_INTRO_STALLS ' + introStalls + ' audio=' + JSON.stringify(Sound.getMemoryStats()) + ' vram=' + Screen.getFreeVRAM());
+    intro = null;
+    introMeta = null;
+    introShown = [];
+    enterMenu();
+    flash(0, 0, 0, 1.2);
+  }
+
+  function introPrefetch() {
+    for (const page of pagesAhead(intro, 14)) prefetchTile(introPath(page), ImageList.HIGH);
+    const keep = introShown.length ? Math.min(...introShown.map((t) => t.page)) : 0;
+    for (const [path, e] of images) {
+      if (!path.startsWith('assets/intro/')) continue;
+      if (Number(path.slice(-6, -4)) < keep) {
+        e.image.free();
+        images.delete(path);
+        bytes -= e.bytes;
+      }
+    }
+  }
+
+  function updateIntro(dt) {
+    introPrefetch();
+    if (!introStarted) {
+      introStarted = pagesAhead(intro, 2).every((page) => {
+        const e = images.get(introPath(page));
+        return e && e.image.ready();
+      });
+      introWait += dt;
+      if (!introStarted && introWait > 8) {
+        console.log('GG_INTRO_SKIP pictures did not load');
+        leaveIntro();
+        return;
+      }
+    } else {
+      stepIntro(intro, dt);
+      if (introWarm < MENU_WARM.length && intro.frame > 115 && intro.frame < 185) warmMenuArt(); // logo is static from frame ~100 to 192
+    }
+    if (introStarted) {
+      for (const id of dueSounds(intro)) if (prefs.sfx && introSfx[id]) introSfx[id].play();
+    }
+    if (intro.done) {
+      console.log('GG_INTRO_DONE');
+      leaveIntro();
+    }
+  }
+
+  function drawIntro() {
+    if (!intro) return;
+    const tiles = introTiles(intro).map((id) => introMeta.tiles[id]);
+    if (tiles.length) {
+      const imgs = tiles.map((t) => {
+        const e = images.get(introPath(t.page));
+        if (e) e.seen = drawFrameNumber;
+        return e && e.image.ready() ? e.image : null;
+      });
+      if (imgs.every(Boolean)) introShown = tiles.map((t, i) => ({ page: t.page, t, img: imgs[i] }));
+      else introStalls++;
+    } else introShown = [];
+    for (const q of introShown) {
+      const t = q.t;
+      q.img.draw(Math.round(OX0 + introMeta.origin[0] + t.x), Math.round(introMeta.origin[1] + t.y), {
+        width: t.w,
+        height: t.h,
+        startx: t.sx,
+        starty: t.sy,
+        endx: t.sx + t.w,
+        endy: t.sy + t.h,
+      });
+    }
+  }
+
   function startSolo(cont = false) {
     puffs.length = 0;
     checkpointBanner = 0;
@@ -593,7 +777,7 @@ export function startGame({
   }
 
   function startMulti(reset = true) {
-    tutorial = 0;
+    tutorial = 3; // PlayState.create: FlxG.tutorial = true when numPlayers > 1 ("Press SPACE to start")
     if (reset) {
       wins = [0, 0, 0, 0];
       round = 1;
@@ -676,13 +860,13 @@ export function startGame({
   }
 
   function input() {
-    if (fadeFx || splashFx) return;
+    if (fadeFx || splashFx || screen === 'intro') return;
     const p = pads[0];
     if (screen === 'game' && pads.some((pad, i) => i < state.players.length && pad.justDisconnected)) {
       paused = true;
       subCursor = 0;
     }
-    if (!p.connected) return;
+    if (!p.connected && !(screen === 'game' && tutorial === 3)) return;
     const up = p.repeatPressed(Gamepad.UP),
       down = p.repeatPressed(Gamepad.DOWN),
       left = p.repeatPressed(Gamepad.LEFT),
@@ -746,6 +930,14 @@ export function startGame({
       }
       if (back) screen = returnTo;
     } else if (screen === 'game') {
+      if (tutorial === 3 && !paused) {
+        if (pads.some((pd) => pd.connected && pd.justPressed(Gamepad.START))) {
+          sfx('SndPopupDisappear');
+          tutorial = 0;
+          pending.fill(false);
+        }
+        return;
+      }
       if (tutorial && !paused) {
         if (ok) {
           sfx('SndPopupDisappear');
@@ -841,7 +1033,7 @@ export function startGame({
     }
     art('PlayState_ImgBackground', 0, 59);
     for (let i = -1; i < 3; i++) art('PlayState_ImgBackground2', i * 444 - ((cameraX * 0.25) % 444), 264);
-    art('PlayState_ImgSun', 365, 70);
+    art('PlayState_ImgSun', 39, 266); // PlayState.as:1024, scrollFactor 0
     for (let i = -1; i < 3; i++) art('PlayState_ImgBackground1', i * 427 - ((cameraX * 0.5) % 427), 254);
     for (let i = -1; i < 3; i++) art('PlayState_ImgBackship', i * 350 - ((cameraX * 0.26) % 350), 59);
     for (let i = -1; i < 3; i++) {
@@ -851,16 +1043,94 @@ export function startGame({
   }
 
   let renderLevel = null,
-    renderBins = null;
+    renderBins = null,
+    atlas = null;
+
+  function freeAtlas() {
+    if (!atlas) return;
+    atlas.image.unlock();
+    atlas.image.free();
+    atlas = null;
+  }
+
+  // Static scenery as TileMap sprites (VU1): one resident atlas texture, one sprite list per layer, no streaming.
+  // Sprites are stored nearly x-sorted with the original paint order kept for every overlapping pair, so the
+  // sprites on screen are one contiguous [lo, hi) range found by binary search over prefix/suffix bounds.
+  function buildAtlas(level) {
+    const txt = std.loadFile('assets/scenery/' + level.id + '/sprites.json');
+    if (!txt) return null;
+    const data = JSON.parse(txt),
+      image = new Image(data.path);
+    if (!image.ready()) throw Error('Atlas failed: ' + data.path);
+    image.lock();
+    const o = TileMap.layout.offsets,
+      stride = TileMap.layout.stride,
+      layers = {};
+    for (const kind of ['back', 'front']) {
+      const L = data[kind],
+        n = L.x.length;
+      if (!n) continue;
+      const buf = TileMap.SpriteBuffer.create(n),
+        dv = new DataView(buf),
+        sufMinL = new Float32Array(n + 1),
+        prefMaxR = new Float32Array(n + 1);
+      for (let i = 0; i < n; i++) {
+        const at = i * stride;
+        dv.setFloat32(at + o.x, L.x[i] * WS, true);
+        dv.setFloat32(at + o.y, L.y[i] * WS, true);
+        dv.setFloat32(at + o.w, L.w[i] * WS, true);
+        dv.setFloat32(at + o.h, L.h[i] * WS, true);
+        dv.setFloat32(at + o.u1, L.u[i], true);
+        dv.setFloat32(at + o.v1, L.v[i], true);
+        dv.setFloat32(at + o.u2, L.u[i] + L.tw[i], true);
+        dv.setFloat32(at + o.v2, L.v[i] + L.th[i], true);
+        for (const c of ['r', 'g', 'b', 'a']) dv.setUint32(at + o[c], 128, true);
+        prefMaxR[i + 1] = Math.max(prefMaxR[i], L.x[i] + L.w[i]);
+      }
+      sufMinL[n] = 1e9;
+      for (let i = n - 1; i >= 0; i--) sufMinL[i] = Math.min(sufMinL[i + 1], L.x[i]);
+      const descriptor = new TileMap.Descriptor({
+        textures: [image],
+        materials: [{ textureIndex: 0, endOffset: n - 1 }],
+      });
+      layers[kind] = { map: new TileMap.Instance({ descriptor, spriteBuffer: buf }), n, sufMinL, prefMaxR };
+    }
+    console.log('GG_ATLAS ' + level.id + ' ' + data.w + 'x' + data.h + ' back=' + (data.back.x.length) + ' front=' + data.front.x.length);
+    return { image, layers };
+  }
+
+  // First index i with a[i] > v in a nondecreasing array.
+  function upperBound(a, v, n) {
+    let lo = 0,
+      hi = n;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid] > v) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
+  }
+
+  function drawAtlas(kind, camera) {
+    const L = atlas.layers[kind];
+    if (!L) return;
+    const lo = Math.max(0, upperBound(L.prefMaxR, camera, L.n + 1) - 1),
+      hi = upperBound(L.sufMinL, camera + VW + 8, L.n + 1);
+    if (hi <= lo) return;
+    L.map.render(OX - camera * WS, OY, { first: lo, count: hi - lo });
+    perf.sprites += hi - lo;
+  }
 
   function buildRender(level) {
     if (renderLevel === level) return;
     renderLevel = level;
     const scene = level.id === 'credits' ? CREDITS : SCENERY[level.id];
     if (!scene) throw Error('Scenery missing: ' + level.id);
+    freeAtlas();
+    atlas = level.id === 'credits' || !useAtlas ? null : buildAtlas(level);
     renderBins = {
-      back: scene.back,
-      front: scene.front,
+      back: atlas ? [] : scene.back,
+      front: atlas ? [] : scene.front,
       animated: {
         back: [...(scene.animated.back || [])].sort((a, b) => a.x - b.x),
         front: [...(scene.animated.front || [])].sort((a, b) => a.x - b.x),
@@ -868,7 +1138,7 @@ export function startGame({
     };
     checkpointArt = buildCheckpointArt(level);
     checkpointTimes = {};
-    prefetchAround(Math.max(0, state.cameraX - 320), ImageList.HIGH);
+    if (!atlas) prefetchAround(Math.max(0, state.cameraX - 320), ImageList.HIGH);
   }
 
   function lowerBound(list, x) {
@@ -883,10 +1153,12 @@ export function startGame({
   }
 
   function scenery(kind, camera) {
-    const tiles = renderBins[kind];
+    if (atlas) drawAtlas(kind, camera);
+    const tiles = renderBins[kind],
+      ahead = lookahead();
     for (let i = lowerBound(tiles, camera - 512); i < tiles.length; i++) {
       const q = tiles[i];
-      if (q.x > camera + VW + 1100) break;
+      if (q.x > camera + VW + ahead) break;
       if (q.x > camera + VW) {
         prefetchTile(q.path);
         continue;
@@ -894,6 +1166,7 @@ export function startGame({
       if (q.x + q.w >= camera) {
         const img = tile(q.path);
         if (img) img.draw(OX + (q.x - camera) * K, OY, { width: q.w * K, height: q.h * K });
+        else perf.missing++;
       }
     }
     const anim = renderBins.animated[kind];
@@ -965,7 +1238,8 @@ export function startGame({
       if (a) art('PlayState_ImgSonicBoom', boom.x - camera, boom.y, 1, 1, undefined, (boom.angle * Math.PI) / 180);
     }
     pf('checkpointArt');
-    for (const p of state.players) actor(p, camera);
+    for (const p of state.players)
+      if (!(tutorial === 3 && multiTimer < 0.4 && p.animTime * RATES.morph > 16)) actor(p, camera);
     for (const f of puffs)
       frame('PlayState_ImgPuff', Math.min(5, Math.floor(f.t * 18)), f.x - camera, f.y, { flipY: f.flip });
     if (state.enemy) actor(state.enemy, camera, true);
@@ -1011,6 +1285,8 @@ export function startGame({
       fBonus.color = Color.new(255, 255, 255, Math.round(128 * al));
       fBonus.print(OX + (634 - w) * S, (23 - (3 - t) * 4.7) * S, str);
     }
+    if (tutorial === 3 && multiTimer >= 0.4 && state.players[0].animTime * RATES.morph > 16)
+      center('Press START to start', 106, white, true);
     if (tutorial === 2) {
       art('PlayState_ImgDontGetCaught', 98, 139);
       art('PlayState_ImgContinueOver', 209, 288);
@@ -1024,7 +1300,6 @@ export function startGame({
       if (state.players.length === 1) {
         if (endTime > 1) {
           const sc = Math.min(1, 0.5 + (endTime - 1) * 2);
-          box(0, 0, 640, 501, shade);
           art('PlayState_ImgTheEnd', (640 * (1 - sc)) / 2, (501 * (1 - sc)) / 2, sc, sc);
           if (sc >= 1) {
             {
@@ -1102,7 +1377,8 @@ export function startGame({
     OX =
       OX0 + (shakeFx && (screen === 'game' || screen === 'menu') ? (Math.random() * 2 - 1) * shakeFx.amount * 640 : 0);
 
-    if (screen === 'menu' || screen === 'multi') drawMenu();
+    if (screen === 'intro') drawIntro();
+    else if (screen === 'menu' || screen === 'multi') drawMenu();
     else if (screen === 'game') drawGame();
     else if (screen === 'loading') art('MenuState_ImgLoadingSplash', 0, 0);
     else if (screen === 'resume') {
@@ -1135,6 +1411,7 @@ export function startGame({
   }
 
   function updateMenu(dt) {
+    if (screen === 'intro') return;
     const opened = screen === 'multi' || screen === 'resume' || screen === 'scores';
     const l = opened ? -200 : 0,
       r = opened ? 659 : 459,
@@ -1249,17 +1526,24 @@ export function startGame({
   for (const name of ['cdfs', 'usbd', 'bdm', 'bdmfs_fatfs', 'usbmass_bd'])
     if (!IOP.getModule(name)) throw Error('Required IOP module missing: ' + name);
   preloadSfx();
-  enterMenu();
+  if (validation || endingValidation || perfRun || menuValidation) enterMenu();
   if (validation) validationScene();
   else if (endingValidation) beginEndingValidation();
   else if (perfRun) beginPerfRun();
-  else flash(0, 0, 0, 1.2);
+  else if (menuValidation) flash(0, 0, 0, 1.2);
+  else if (startCheckpoint) {
+    prefs.checkpoint = startCheckpoint;
+    prefs.score = startScore;
+    enterMenu();
+    startSolo(true);
+  }
+  else enterIntro();
   Loop.addSystem({
     name: 'gg-input',
     realTime: true,
     preUpdate(dt) {
       clock += dt;
-      loader.process({ maxItems: 1, maxTime: 3 });
+      loader.process({ maxItems: 2, maxTime: 4 });
       if (fadeFx) {
         fadeFx.t += dt;
         if (fadeFx.t >= fadeFx.dur) {
@@ -1282,6 +1566,7 @@ export function startGame({
         shakeFx.t += dt;
         if (shakeFx.t >= shakeFx.dur) shakeFx = null;
       }
+      if (screen === 'intro') updateIntro(dt);
       updateMenu(dt);
       noticeLeft = Math.max(0, noticeLeft - dt);
       Gamepad.update();
@@ -1326,6 +1611,19 @@ export function startGame({
           ev.hold -= dt;
           return;
         }
+        if (tutorial === 3) {
+          // players keep morphing but nothing moves until START; the prompt blinks once the morph is past frame 16 (multiStartFlicker)
+          for (const q of state.players)
+            if (q.morphLeft > 0.001) {
+              q.morphLeft = Math.max(0.001, q.morphLeft - dt);
+              q.animTime += dt;
+            }
+          if (state.players[0].animTime * RATES.morph > 16) {
+            multiTimer -= dt;
+            if (multiTimer <= 0) multiTimer = 0.8;
+          }
+          return;
+        }
         if (tutorial) return;
         sceneTime += dt;
         if (state.options.credits) creditsTime += dt;
@@ -1346,7 +1644,8 @@ export function startGame({
         pf('_');
         const wasEnd = endTime;
         if (soak) {
-          state.cameraX += 260 * dt;
+          state.cameraX += soakSpeed * dt;
+          state.players[0].vx = soakSpeed;
           state.players[0].x = state.cameraX;
           state.players[0].prevX = state.cameraX;
         } else stepGame(state, pending, dt);
@@ -1356,9 +1655,17 @@ export function startGame({
           endTime += dt;
           if (wasEnd <= 1 && endTime > 1) sfx('SndPopupAppear');
         }
-        if (state.options.credits && (state.status === 'dead' || state.players[0].x > CREDITS.width - 100)) {
-          enterMenu();
-          return;
+        if (state.options.credits) {
+          // PlayState.as:2953-2970: falling out of the credits only reloads them (timeToReload 1.3 s); the end of the course goes to the menu
+          if (state.status === 'dead' && state.deathTime <= 0.001) {
+            startCredits();
+            flash(19, 28, 27, 1);
+            return;
+          }
+          if (state.status !== 'dead' && state.players[0].x > CREDITS.width - 100) {
+            enterMenu();
+            return;
+          }
         }
         for (const e of state.events) {
           if (e.type === 'flip') {
@@ -1560,8 +1867,17 @@ export function startGame({
                   sec: Object.fromEntries(Object.entries(perf.sec).map(([k, v]) => [k, +(v / 120).toFixed(2)])),
                   imageBytes: bytes,
                   eeFree: System.getFreeMemory(),
+                  vel: Math.round(state.players[0].vx),
+                  musicMs: music ? Math.round(music.position) : 0,
+                  musicRate: music ? music.rate : 0,
+                  musicConv: music ? music.converted : null,
+                  missing: perf.missing,
+                  sprites: perf.sprites,
+                  loader: loader.stats(),
                 })
             );
+            perf.missing = 0;
+            perf.sprites = 0;
             perf.names.length = 0;
             perf.frames.length = 0;
             perf.queued = 0;

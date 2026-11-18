@@ -20,8 +20,10 @@ Gravity flips when the character touches a surface; a mid-air press is buffered 
 
 ## Features
 
+- Scenery is drawn with the native `TileMap` module (VU1): one resident texture atlas per level plus a sprite list, so nothing streams during play (`tools/build_scenery_atlas.py`; the credits still use baked 512 px pages).
 - Campaign with five sections, 21 checkpoints, accelerators and a chaser; the "Don't get caught" tutorial is shown on a new game.
 - Local multiplayer with player-to-player collision, elimination and a results screen.
+- Armor Games opening (swords, logo and fade, 40 fps, not skippable like the original) before the main menu.
 - Main menu, continue prompt, pause, credits and ending built from the original bitmaps and coordinates.
 - Fixed 40 Hz simulation with interpolated NTSC presentation; pre-composited scenery and indexed textures to cut draw cost and VRAM use.
 - Online services and ads from the original were not ported.

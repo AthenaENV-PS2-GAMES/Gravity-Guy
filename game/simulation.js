@@ -202,6 +202,8 @@ export function createGame(level, options = {}) {
     tick: 0,
     status: 'playing',
     deathTime: 0,
+    endTimer: null, // multiplayer: PlayState timeToReload (1.7 s) once all but one player are out
+    endSpeed: 0,
     events: [],
     consumed: new Set(),
     winner: 0,
@@ -533,7 +535,12 @@ export function stepGame(s, inputs = [], dt = 1 / RULES.hz) {
 
   const multi = s.players.length > 1,
     wasMorph = s.players[0].morphLeft > 0;
-  if (multi && !wasMorph) {
+  if (multi && s.endTimer !== null) {
+    // PlayState.as:2383-2398: acceleration 0 and the camera loses 80% of its speed at the moment of the last death per second
+    if (!s.endSpeed) s.endSpeed = s.cameraSpeed;
+    s.cameraSpeed = Math.max(0, s.cameraSpeed - s.endSpeed * 0.8 * dt);
+    s.cameraX += s.cameraSpeed * dt;
+  } else if (multi && !wasMorph) {
     const nv = s.cameraSpeed + 7.740191 * dt;
     s.cameraX += (s.cameraSpeed + nv) * 0.5 * dt;
     s.cameraSpeed = nv;
@@ -651,14 +658,20 @@ export function stepGame(s, inputs = [], dt = 1 / RULES.hz) {
     for (const p of s.players) if (p.alive) ejectFromSolids(s, p);
     const alive = s.players.filter((p) => p.alive);
 
-    if (alive.length <= 1 && !wasMorph) {
-      s.status = 'results';
-      s.winner = alive.length ? alive[0].id : 0;
-      if (alive.length) {
-        alive[0].standing = 1;
-        alive[0].wins++;
+    if (alive.length <= 1 && !wasMorph && s.endTimer === null) s.endTimer = 1.7;
+    if (s.endTimer !== null) {
+      s.endTimer -= dt;
+      if (s.endTimer <= EPS) {
+        // Player.kill(): whoever is removed when currentStanding is 1 wins; with a simultaneous finish the later index is removed last
+        const last = alive.length ? alive[0] : s.players.find((q) => q.standing === 1);
+        s.status = 'results';
+        s.winner = last ? last.id : 0;
+        if (last) {
+          last.standing = 1;
+          last.wins++;
+        }
+        event(s, 'winner', last, { winner: s.winner });
       }
-      event(s, 'winner', alive[0], { winner: s.winner });
     }
   }
 
